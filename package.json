@@ -10,7 +10,6 @@
     "test:types": "node scripts/test-gridwise-types.ts"
   },
   "dependencies": {
-    "@google/genai": "^2.23.0",
     "javascript-lp-solver": "^1.0.3",
     "next": "16.3.5",
     "react": "19.2.8",

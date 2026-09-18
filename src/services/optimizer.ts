@@ -22,6 +22,17 @@ type LpResult = { feasible?: boolean; result?: number } & Record<
   number | boolean | undefined
 >;
 
+// Thrown when the LP has no feasible solution, so callers can tell "these
+// directives can't be satisfied" apart from solver crashes and bad input.
+export class InfeasibleError extends Error {
+  constructor() {
+    super(
+      "optimizeSchedule: LP model is infeasible for the given hours, battery limits, and directives.",
+    );
+    this.name = "InfeasibleError";
+  }
+}
+
 function round4(value: number): number {
   return Math.round(value * 10000) / 10000;
 }
@@ -211,9 +222,7 @@ export function optimizeSchedule(
   }
 
   if (!result || result.feasible === false) {
-    throw new Error(
-      "optimizeSchedule: LP model is infeasible for the given hours, battery limits, and directives.",
-    );
+    throw new InfeasibleError();
   }
 
   const getVar = (name: string): number => {
@@ -270,4 +279,73 @@ export function optimizeSchedule(
   }
 
   return plan;
+}
+
+function isActive(d: DirectiveInterpretation): boolean {
+  return !!d && d.applies === true && d.directive_type !== "no_op";
+}
+
+// Keeps k items out of n, in lexicographic index order (so earlier notes win ties).
+function* combinations(n: number, k: number): Generator<number[]> {
+  const pick: number[] = [];
+  function* go(start: number): Generator<number[]> {
+    if (pick.length === k) {
+      yield [...pick];
+      return;
+    }
+    for (let i = start; i < n; i++) {
+      pick.push(i);
+      yield* go(i + 1);
+      pick.pop();
+    }
+  }
+  yield* go(0);
+}
+
+// A valid-looking but unsatisfiable directive (e.g. a grid cap far below
+// demand, or an LLM unit slip) makes the LP infeasible. Rather than fail the
+// request, retry with the largest feasible subset of the directives and turn
+// the dropped ones into no_op. If the problem is infeasible even with no
+// directives, the input itself is at fault and the original error is thrown.
+export function optimizeWithRecovery(
+  hours: HourInput[],
+  battery: BatteryInput,
+  directives: DirectiveInterpretation[],
+): { plan: HourlyPlanEntry[]; directives: DirectiveInterpretation[] } {
+  try {
+    return { plan: optimizeSchedule(hours, battery, directives), directives };
+  } catch (err) {
+    if (!(err instanceof InfeasibleError)) throw err;
+
+    const active = directives
+      .map((d, i) => (isActive(d) ? i : -1))
+      .filter((i) => i >= 0);
+
+    for (let keep = active.length - 1; keep >= 0; keep--) {
+      for (const kept of combinations(active.length, keep)) {
+        const keptIdx = new Set(kept.map((k) => active[k]));
+        const candidate = directives.map((d, i) =>
+          isActive(d) && !keptIdx.has(i)
+            ? {
+                note_index: d.note_index,
+                applies: false,
+                directive_type: "no_op" as const,
+                structured_adjustment: null,
+                explanation: `Ignored: ${d.directive_type} made the schedule infeasible. ${d.explanation}`.trim(),
+              }
+            : d,
+        );
+        try {
+          const plan = optimizeSchedule(hours, battery, candidate);
+          console.warn(
+            `[optimizer] infeasible with all directives; dropped ${active.length - keep} of ${active.length}`,
+          );
+          return { plan, directives: candidate };
+        } catch (inner) {
+          if (!(inner instanceof InfeasibleError)) throw inner;
+        }
+      }
+    }
+    throw err;
+  }
 }
