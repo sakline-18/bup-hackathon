@@ -433,6 +433,73 @@ The guardrail (§4) still validates whatever the model returns, so a schema slip
 
 ---
 
+## 9. Phase 7 — Docker Containerization (deployment excluded)
+
+**Status:** partially done, on request. Corresponds to `PLAN.md` → Phase 7, minus its "Container Testing & Publishing" push-to-registry step and "Live Cloud Deployment" step — those were explicitly out of scope for this pass.
+
+**Files created:** [Dockerfile](Dockerfile), [.dockerignore](.dockerignore), [.env.example](.env.example). **File changed:** [next.config.ts](next.config.ts).
+
+### `next.config.ts` — standalone output
+
+Added `output: "standalone"`, exactly as `PLAN.md`'s Phase 1 setup snippet specifies (it was never applied when the config file was first created). This makes `next build` trace the production `node_modules` subset an app actually needs into `.next/standalone`, alongside a self-contained `server.js` — the Docker image copies that output instead of shipping the full `node_modules` tree.
+
+### `Dockerfile` — four-stage build
+
+Follows `PLAN.md`'s `base` → `deps` → `builder` → `runner` structure on `node:22-alpine` (matches the local dev Node version, v22, and clears Next 16's `engines: >=20.9.0` requirement):
+
+| Stage | Does |
+|---|---|
+| `base` | Just the `node:22-alpine` image, reused as the starting point for every other stage so their base layer is shared/cached. |
+| `deps` | Copies only `package.json` + `package-lock.json`, runs `npm ci`. Isolated into its own stage so editing application source doesn't invalidate the dependency-install cache layer. |
+| `builder` | Copies `deps`'s `node_modules`, then the full source, then runs `npm run build`. |
+| `runner` | Copies only `public/`, `.next/standalone`, and `.next/static` from `builder` — no source, no `node_modules`, no devDependencies. Runs as a non-root `nextjs` user (`uid/gid 1001`, added via `addgroup`/`adduser`) rather than root, and starts with `node server.js` (the entrypoint `output: "standalone"` generates) instead of `next start`. |
+
+`ENV NEXT_TELEMETRY_DISABLED=1` is set in both the `builder` and `runner` stages so `next build` and the running server don't phone home during a hackathon build/test loop. `PORT=3000` / `HOSTNAME=0.0.0.0` are set explicitly because the standalone server reads them at startup and defaults to binding `localhost` only, which would be unreachable from outside the container.
+
+`npm ci` (not `npm install`) is used deliberately — it installs exactly what `package-lock.json` pins and fails if the lockfile and `package.json` disagree, which is the correct behavior for a reproducible container build; `README.md`'s "Getting Started" section mentions `npm`/`yarn`/`pnpm`/`bun` interchangeably but the repo only actually has a `package-lock.json`, so `npm` is what the Dockerfile standardizes on.
+
+### `.dockerignore`
+
+Excludes `node_modules`, `.next`, build artifacts, `.env*`, `.git`, and the project's own markdown docs (`README.md`, `DOC.md`, `PLAN.md`, `AGENTS.md`, `CLAUDE.md`) from the build context — none of those are needed inside the image, and keeping `.env*` out specifically prevents a local secret from accidentally being baked into a layer.
+
+### `.env.example`
+
+Documents the two environment variables `src/services/llm.ts` actually reads (`GROQ_API_KEY` required, `GROQ_MODELS` optional) so `docker run -e GROQ_API_KEY=... gridwise-solution:local` has something to reference. `PLAN.md`'s Phase 8 README checklist asks for an "env variables list ( `LLM_API_KEY`, `LLM_MODEL`)" — those are the plan's generic placeholder names from before the Groq switch (§7); the real names used throughout the code are `GROQ_API_KEY` / `GROQ_MODELS`, so the example file uses those instead of the plan's placeholders.
+
+### Verification
+
+Built and ran the image locally (Docker Desktop, on request — this was not done unattended):
+
+- `docker build -t gridwise-solution:local .` — succeeds. `npm run build` inside the `builder` stage shows all three routes compiled (`/`, `/health`, `/optimize-energy`) and `npx tsc` running clean as part of `next build`. Final image: **333 MB**.
+- `docker run -p 3001:3000 -e GROQ_API_KEY="" gridwise-solution:local` — starts in well under a second (`✓ Ready in 0ms`, standalone server has no dev-mode compile step).
+- `GET /health` inside the container → `200 {"status":"ok"}`.
+- `POST /optimize-energy` inside the container, with a synthetic 24-hour payload and an empty `GROQ_API_KEY` → `200` with a full, internally-consistent plan (charges overnight on the cheap tariff, discharges through the expensive hours, `battery_energy_after_kwh` returns to `initial_energy_kwh` at hour 23, `total_cost_bdt`/`total_grid_kwh`/`peak_grid_kwh` all populated). The directive interpretation correctly shows Phase 2's `no_op` fallback (`"LLM interpretation unavailable; defaulted to no_op."`) since no real Groq key was supplied — confirming the whole pipeline (Zod validation → LLM fallback → guardrail → LP solve → replay/format) runs correctly inside the container, not just under `next dev`.
+
+### Explicitly not done (by request)
+
+- **Pushing the image to a registry** (DockerHub/GHCR) — `PLAN.md`'s "Container Testing & Publishing" step.
+- **Live cloud deployment** (Poridhi/AWS/GCP/Render/Railway) and verifying public `/health` / `/optimize-energy` reachability — `PLAN.md`'s "Live Cloud Deployment" step.
+
+Both remain straightforward once a target registry/host is chosen: the image already builds and runs correctly standalone, so publishing is `docker tag` + `docker push`, and deployment is running that same image with `GROQ_API_KEY` set in the host's environment.
+
+---
+
+## 10. Live optimizer form on the landing page
+
+**Status:** done, on request ("make a form containing all the fields from tests.json, connected to the frontend").
+
+**File created:** [components/OptimizeForm.tsx](components/OptimizeForm.tsx) (client component). **File changed:** [app/page.tsx](app/page.tsx) — mounted under a new `#try-it` section, with header/hero links now pointing there instead of `#pipeline`.
+
+The form covers every field `OptimizeEnergyRequestSchema` requires: `scenario_id`, 1–3 `operator_notes` (add/remove, capped at 3), all 5 `battery` fields, and all 24 `hours` rows (`demand_kwh`, `solar_kwh`, `tariff_bdt_per_kwh` — `hour` itself is fixed 0–23, not editable). A dropdown loads any of the 10 cases straight from `tests.json` (imported directly — `resolveJsonModule` was already on) to prefill the whole form, or a blank/all-zero scenario. Submitting `fetch`es `POST /optimize-energy` with the form state as-is (same shape as the request schema, no transformation needed) and renders the response: total cost/grid/peak stat tiles, `plan_summary`, the `directive_interpretation` per note, and the full 24-row `hourly_plan` table. Errors (400/500 `{error}}` or a network failure) show inline instead of throwing.
+
+No new dependencies — plain Tailwind, no shadcn install (`CLAUDE.md` asks for `components/ui/`, but none exists yet in this repo and adding the shadcn CLI mid-hackathon wasn't worth it for one form).
+
+### Verification
+
+`npx tsc --noEmit` shows no new errors (the one pre-existing `app/layout.tsx` error is unrelated, per §6). Ran `npm run dev` and confirmed via `curl` that the page's server-rendered HTML contains the form. Then POSTed SAMPLE-01's `input` object (byte-identical to what the form sends when that sample is loaded and submitted unmodified) straight at `/optimize-energy` and got back `200` with `total_cost_bdt: 34600` and a 24-entry `hourly_plan` — confirming the form's payload shape matches the live route handler end to end. Browser-based click-through wasn't done this pass (the Claude-in-Chrome extension wasn't connected in this environment); the curl check above verifies the wiring but not the on-screen interaction.
+
+---
+
 ## Not yet done
 
-Per `PLAN.md`, still outstanding: Phase 6 (sample-case regression tests), Phase 7 (Docker/deploy), Phase 8 (README/video). Also outstanding: setting `GROQ_API_KEY` and running the 10 sample cases end to end against the live Groq API (§7).
+Per `PLAN.md`, still outstanding: Phase 6 (formal sample-case regression test runner — `tests.json` exists and all 10 cases were exercised ad hoc against the live endpoint in §7/§8, but no `scripts/test-samples.ts` harness was written), the deployment portions of Phase 7 (see §9), Phase 8 (README/video).

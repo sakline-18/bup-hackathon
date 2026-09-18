@@ -1,3 +1,5 @@
+import OptimizeForm from "@/components/OptimizeForm";
+
 const pipeline = [
   {
     step: "01",
@@ -52,12 +54,20 @@ export default function Home() {
             GridWise
           </span>
         </div>
-        <a
-          href="#pipeline"
-          className="rounded-full border border-slate-200 px-4 py-2 text-sm font-medium text-slate-700 transition-colors hover:border-slate-300 hover:bg-slate-50 dark:border-white/10 dark:text-slate-200 dark:hover:bg-white/5"
-        >
-          View pipeline
-        </a>
+        <div className="flex items-center gap-2">
+          <a
+            href="#pipeline"
+            className="rounded-full border border-slate-200 px-4 py-2 text-sm font-medium text-slate-700 transition-colors hover:border-slate-300 hover:bg-slate-50 dark:border-white/10 dark:text-slate-200 dark:hover:bg-white/5"
+          >
+            View pipeline
+          </a>
+          <a
+            href="#try-it"
+            className="rounded-full bg-emerald-500 px-4 py-2 text-sm font-medium text-white shadow-sm transition-colors hover:bg-emerald-600"
+          >
+            Try it
+          </a>
+        </div>
       </header>
 
       <main className="relative mx-auto flex w-full max-w-6xl flex-1 flex-col gap-24 px-6 pb-24 sm:px-10">
@@ -76,10 +86,10 @@ export default function Home() {
           </p>
           <div className="mt-2 flex flex-col gap-3 sm:flex-row">
             <a
-              href="#pipeline"
+              href="#try-it"
               className="flex h-11 items-center justify-center rounded-full bg-slate-900 px-6 text-sm font-medium text-white shadow-lg shadow-slate-900/10 transition-colors hover:bg-slate-700 dark:bg-white dark:text-slate-900 dark:hover:bg-slate-200"
             >
-              Explore the pipeline
+              Try it live
             </a>
             <a
               href="#stats"
@@ -141,6 +151,20 @@ export default function Home() {
               </div>
             ))}
           </div>
+        </section>
+
+        {/* Try it */}
+        <section id="try-it" className="flex flex-col gap-10 scroll-mt-24">
+          <div className="flex flex-col items-center gap-2 text-center">
+            <h2 className="text-2xl font-semibold tracking-tight text-slate-900 sm:text-3xl dark:text-white">
+              Try the optimizer
+            </h2>
+            <p className="max-w-lg text-sm text-slate-500 dark:text-slate-400">
+              Load one of the 10 public sample cases or build your own scenario, then
+              submit it straight to <code>POST /optimize-energy</code>.
+            </p>
+          </div>
+          <OptimizeForm />
         </section>
       </main>
 
