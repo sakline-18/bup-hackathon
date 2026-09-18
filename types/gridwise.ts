@@ -15,25 +15,38 @@ export type BatteryAction = z.infer<typeof BatteryActionSchema>;
 
 export const HourInputSchema = z.object({
   hour: z.number().int().min(0).max(23),
-  demand_kwh: z.number(),
-  solar_kwh: z.number(),
-  tariff_bdt_per_kwh: z.number(),
+  demand_kwh: z.number().nonnegative(),
+  solar_kwh: z.number().nonnegative(),
+  tariff_bdt_per_kwh: z.number().nonnegative(),
 });
 export type HourInput = z.infer<typeof HourInputSchema>;
 
-export const BatteryInputSchema = z.object({
-  capacity_kwh: z.number(),
-  initial_energy_kwh: z.number(),
-  minimum_energy_kwh: z.number(),
-  max_charge_kwh_per_hour: z.number(),
-  max_discharge_kwh_per_hour: z.number(),
-});
+export const BatteryInputSchema = z
+  .object({
+    capacity_kwh: z.number().nonnegative(),
+    initial_energy_kwh: z.number().nonnegative(),
+    minimum_energy_kwh: z.number().nonnegative(),
+    max_charge_kwh_per_hour: z.number().nonnegative(),
+    max_discharge_kwh_per_hour: z.number().nonnegative(),
+  })
+  // 0 <= minimum <= initial <= capacity, or the LP is infeasible before any directive.
+  .refine(
+    (b) =>
+      b.minimum_energy_kwh <= b.initial_energy_kwh &&
+      b.initial_energy_kwh <= b.capacity_kwh,
+    { message: "require minimum_energy_kwh <= initial_energy_kwh <= capacity_kwh" },
+  );
 export type BatteryInput = z.infer<typeof BatteryInputSchema>;
 
 export const OptimizeEnergyRequestSchema = z.object({
   scenario_id: z.string(),
-  operator_notes: z.array(z.string()).min(1).max(3),
-  hours: z.array(HourInputSchema).length(24),
+  operator_notes: z.array(z.string().trim().min(1)).min(1).max(3),
+  hours: z
+    .array(HourInputSchema)
+    .length(24)
+    .refine((hs) => new Set(hs.map((h) => h.hour)).size === 24, {
+      message: "hours must cover 0-23 exactly once each",
+    }),
   battery: BatteryInputSchema,
 });
 export type OptimizeEnergyRequest = z.infer<typeof OptimizeEnergyRequestSchema>;

@@ -1,5 +1,7 @@
 # GridWise LLM-Assisted Energy Optimization - Action Plan
 
+> **Historical planning document.** It predates the implementation and is partly out of date: there is no Dockerfile, `next.config.ts` has no standalone output, and the LLM key is `GROQ_API_KEY` (not `LLM_API_KEY`). See [README.md](README.md) for current setup.
+
 This document outlines the step-by-step execution plan for the BUP CSE Fest 2026 GridWise challenge. It is designed to be executed sequentially in a Next.js + TypeScript environment.
 
 ## System Architecture & Technical Specifications

@@ -29,7 +29,7 @@ The interesting part is how it gets from English to a schedule without trusting 
 
 ## Quickstart
 
-**Prerequisites:** Node.js 20.9 or newer (developed on Node 24), npm, and a free [Groq API key](https://console.groq.com).
+**Prerequisites:** Node.js 20.9 or newer (22.18+ for `npm run test:types`; developed on Node 24), npm, and a free [Groq API key](https://console.groq.com).
 
 ```bash
 git clone <this-repo-url>
@@ -157,7 +157,8 @@ Real (abbreviated) response for the request above:
 
 | Status | When | Body |
 |---|---|---|
-| 400 | The body is not valid JSON, or does not match the request schema (wrong hour count, missing fields, more than 3 notes, ...). | `{"error":"Malformed JSON or structurally invalid request."}` |
+| 400 | The body is not valid JSON, or does not match the request schema (wrong hour count, duplicate/missing hours, negative values, battery not satisfying minimum ≤ initial ≤ capacity, empty or more than 3 notes, ...). | `{"error":"Malformed JSON or structurally invalid request."}` |
+| 422 | The input is valid but no schedule can satisfy it even with every directive dropped. | `{"error":"No feasible schedule exists for the given hours and battery limits."}` |
 | 500 | Something unrecoverable failed after validation. Details go to the server log only. | `{"error":"Internal server error while optimizing energy."}` |
 
 Error bodies never include stack traces, keys or internal messages.
@@ -280,7 +281,7 @@ Overlapping directives combine sensibly: solar factors multiply, reserves take t
 
 **Cleaning the solver output.** Raw LP output can contain values like `4.999999999997`. The plan is rebuilt hour by hour: net battery movement is rounded to 4 decimals and turned into `charge`, `discharge` or `idle` (movements under 0.0001 count as idle); energy is carried forward from the rounded values; hour 23 is forced to close exactly back to the initial energy; and `grid_kwh` is recomputed as the leftover so every hour's balance stays exact.
 
-**Recovering from impossible directives.** A directive can be valid in shape yet impossible in practice (for example a grid cap of 10 kWh when demand is 150 kWh, or a unit slip like `0.18` instead of `180`). If the LP is infeasible, the optimizer tries the largest subset of directives that *is* feasible (earlier notes win ties). Dropped directives are rewritten as `no_op` with an `Ignored: ... made the schedule infeasible` explanation, so the response stays honest about what was applied. If the problem is infeasible even with **no** directives, the input itself is at fault and the request fails with HTTP 500.
+**Recovering from impossible directives.** A directive can be valid in shape yet impossible in practice (for example a grid cap of 10 kWh when demand is 150 kWh, or a unit slip like `0.18` instead of `180`). If the LP is infeasible, the optimizer tries the largest subset of directives that *is* feasible (earlier notes win ties). Dropped directives are rewritten as `no_op` with an `Ignored: ... made the schedule infeasible` explanation, so the response stays honest about what was applied. If the problem is infeasible even with **no** directives, the input itself is at fault and the request fails with HTTP 422.
 
 ### 5. Replay validator (`src/services/replay.ts`)
 
@@ -303,7 +304,8 @@ If it passes, `total_grid_kwh`, `total_cost_bdt` and `peak_grid_kwh` are **recal
 | LLM down, slow, rate-limited or returns junk | Next model in the chain, then `no_op` for every note. The request still returns 200. |
 | LLM output malformed for one note | That note becomes `no_op`. |
 | Directive impossible to satisfy | Directive dropped and re-solved; request returns 200. |
-| Solver crash, replay violation, or infeasible even with no directives | HTTP 500 with a generic message. |
+| Infeasible even with no directives | HTTP 422. |
+| Solver crash, replay violation, or response schema violation | HTTP 500 with a generic message. |
 
 ---
 
@@ -343,7 +345,7 @@ Any Node host works: `npm run build && npm start` serves on port 3000.
 | Command | What it checks |
 |---|---|
 | `npm run test:samples` | Runs all 10 cases in `tests.json` against a running server (`BASE_URL` selects which). Checks each note's `applies`, `directive_type` and adjustment (hour and key order ignored), total cost within 0.01 BDT, and that the battery ends at its initial energy. |
-| `npm run test:types` | Validates the Zod schemas with valid and invalid data (17 checks). |
+| `npm run test:types` | Validates the Zod schemas with valid and invalid data (19 checks). |
 | `npx tsc --noEmit` | Type check. |
 
 **Results** (last full run, live Groq API):
@@ -351,7 +353,7 @@ Any Node host works: `npm run build && npm start` serves on port 3000.
 - **10 / 10 sample cases pass** end to end. Observed request time was roughly 0.4–2.2 s.
 - Every case matches the reference `total_cost_bdt` and `total_grid_kwh` exactly.
 - **Model accuracy.** The first four models were each run on the 10 samples plus 23 extra notes written to be tricky (percentage wording, "only X% usable", windows ending at midnight or wrapping past it, MWh units, distractors, a cancelled event, a prompt-injection attempt, note ordering). `gpt-oss-20b`, `gpt-oss-120b` and `gpt-oss-safeguard-20b` each got 43/43 directives right; `qwen/qwen3.8-27b` got 33/43 (see below). These extra notes were written after seeing the samples and several prompt lines were added to fix failures they exposed, so the result shows the fixes work, not that unseen wording is guaranteed.
-- **Plans can differ from the reference and still be correct.** Many schedules have the same optimal cost. Our hourly plans differ from the reference plans, and in two cases (SAMPLE-01 and SAMPLE-09) `peak_grid_kwh` differs too, at identical cost. The challenge rules say equivalent optimal schedules are accepted and that reported totals must match the returned plan, which they do.
+- **Plans can differ from the reference and still be correct.** Many schedules have the same optimal cost. Our hourly plans differ from the reference plans. Among cost-optimal plans the optimizer runs a second LP pass that minimizes the peak hourly grid import, so `peak_grid_kwh` matches the reference on all 10 samples. The challenge rules say equivalent optimal schedules are accepted and that reported totals must match the returned plan, which they do.
 
 ---
 

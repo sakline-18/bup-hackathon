@@ -132,7 +132,8 @@ Return ONLY a JSON object of the form {"directives": [...]} matching the provide
 }
 
 function buildUserPrompt(notes: string[]): string {
-  const numbered = notes.map((note, i) => `${i}: ${note}`).join("\n");
+  // JSON-quote each note so an embedded newline can't forge another "N:" line.
+  const numbered = notes.map((note, i) => `${i}: ${JSON.stringify(note)}`).join("\n");
   return `operator_notes (index: text):\n${numbered}`;
 }
 

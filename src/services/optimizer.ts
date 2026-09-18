@@ -225,60 +225,93 @@ export function optimizeSchedule(
     throw new InfeasibleError();
   }
 
-  const getVar = (name: string): number => {
-    const raw = result[name];
-    return typeof raw === "number" && Number.isFinite(raw) ? raw : 0;
-  };
+  const buildPlan = (res: LpResult): HourlyPlanEntry[] => {
+    const getVar = (name: string): number => {
+      const raw = res[name];
+      return typeof raw === "number" && Number.isFinite(raw) ? raw : 0;
+    };
 
-  const plan: HourlyPlanEntry[] = [];
-  let prevEnergy = battery.initial_energy_kwh;
+    const plan: HourlyPlanEntry[] = [];
+    let prevEnergy = battery.initial_energy_kwh;
 
-  for (let h = 0; h < HOURS; h++) {
-    const hourInput = sortedHours[h];
-    const c = getVar(`c${h}`);
-    const d = getVar(`d${h}`);
+    for (let h = 0; h < HOURS; h++) {
+      const hourInput = sortedHours[h];
+      const c = getVar(`c${h}`);
+      const d = getVar(`d${h}`);
 
-    // Hour 23 forces exact closure against drift instead of trusting c_23/d_23.
-    const delta = h === HOURS - 1 ? battery.initial_energy_kwh - prevEnergy : c - d;
+      // Hour 23 forces exact closure against drift instead of trusting c_23/d_23.
+      const delta = h === HOURS - 1 ? battery.initial_energy_kwh - prevEnergy : c - d;
 
-    let action: HourlyPlanEntry["battery_action"];
-    let batteryKwh: number;
-    if (delta > EPS) {
-      action = "charge";
-      batteryKwh = round4(delta);
-    } else if (delta < -EPS) {
-      action = "discharge";
-      batteryKwh = round4(-delta);
-    } else {
-      action = "idle";
-      batteryKwh = 0;
+      let action: HourlyPlanEntry["battery_action"];
+      let batteryKwh: number;
+      if (delta > EPS) {
+        action = "charge";
+        batteryKwh = round4(delta);
+      } else if (delta < -EPS) {
+        action = "discharge";
+        batteryKwh = round4(-delta);
+      } else {
+        action = "idle";
+        batteryKwh = 0;
+      }
+
+      const batteryCharge = action === "charge" ? batteryKwh : 0;
+      const batteryDischarge = action === "discharge" ? batteryKwh : 0;
+      const energyAfter = round4(prevEnergy + batteryCharge - batteryDischarge);
+
+      const solarUsed = round4(
+        Math.min(Math.max(getVar(`s${h}`), 0), effectiveSolarAt(h)),
+      );
+      const gridKwh = Math.max(
+        0,
+        round4(hourInput.demand_kwh + batteryCharge - solarUsed - batteryDischarge),
+      );
+
+      plan.push({
+        hour: hourInput.hour,
+        grid_kwh: gridKwh,
+        solar_used_kwh: solarUsed,
+        battery_action: action,
+        battery_kwh: batteryKwh,
+        battery_energy_after_kwh: energyAfter,
+      });
+
+      prevEnergy = energyAfter;
     }
+    return plan;
+  };
+  const planCost = (plan: HourlyPlanEntry[]): number =>
+    plan.reduce((sum, p, h) => sum + p.grid_kwh * sortedHours[h].tariff_bdt_per_kwh, 0);
 
-    const batteryCharge = action === "charge" ? batteryKwh : 0;
-    const batteryDischarge = action === "discharge" ? batteryKwh : 0;
-    const energyAfter = round4(prevEnergy + batteryCharge - batteryDischarge);
+  const costPlan = buildPlan(result);
 
-    const solarUsed = round4(
-      Math.min(Math.max(getVar(`s${h}`), 0), effectiveSolarAt(h)),
-    );
-    const gridKwh = Math.max(
-      0,
-      round4(hourInput.demand_kwh + batteryCharge - solarUsed - batteryDischarge),
-    );
-
-    plan.push({
-      hour: hourInput.hour,
-      grid_kwh: gridKwh,
-      solar_used_kwh: solarUsed,
-      battery_action: action,
-      battery_kwh: batteryKwh,
-      battery_energy_after_kwh: energyAfter,
-    });
-
-    prevEnergy = energyAfter;
+  // Tie-break among cost-optimal plans: hold cost at its optimum, minimize the
+  // peak hourly grid import. Kept only if rounding leaves the cost unchanged
+  // (within 0.001 BDT); otherwise, or on any failure, the cost-only plan wins.
+  if (typeof result.result === "number" && Number.isFinite(result.result)) {
+    for (const vars of Object.values(model.variables)) {
+      if (vars.cost) vars.costCap = vars.cost;
+    }
+    model.constraints.costCap = { max: result.result + 1e-6 };
+    v("P").peak = 1;
+    for (let h = 0; h < HOURS; h++) {
+      v(`g${h}`)[`peakLim${h}`] = 1;
+      v("P")[`peakLim${h}`] = -1;
+      model.constraints[`peakLim${h}`] = { max: 0 };
+    }
+    model.optimize = "peak";
+    try {
+      const second = solver.Solve(model) as LpResult;
+      if (second && second.feasible !== false) {
+        const peakPlan = buildPlan(second);
+        if (Math.abs(planCost(peakPlan) - planCost(costPlan)) <= 1e-3) return peakPlan;
+      }
+    } catch {
+      // keep the cost-only plan
+    }
   }
 
-  return plan;
+  return costPlan;
 }
 
 function isActive(d: DirectiveInterpretation): boolean {

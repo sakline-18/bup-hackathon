@@ -1,8 +1,11 @@
 import { NextResponse } from "next/server";
-import { OptimizeEnergyRequestSchema } from "@/types/gridwise";
+import {
+  OptimizeEnergyRequestSchema,
+  OptimizeEnergyResponseSchema,
+} from "@/types/gridwise";
 import { interpretOperatorNotes } from "@/src/services/llm";
 import { normalizeDirectives } from "@/src/services/guardrail";
-import { optimizeWithRecovery } from "@/src/services/optimizer";
+import { InfeasibleError, optimizeWithRecovery } from "@/src/services/optimizer";
 import { validateAndFormatPlan } from "@/src/services/replay";
 
 export async function POST(request: Request) {
@@ -31,9 +34,17 @@ export async function POST(request: Request) {
     );
     // Drops directives that make the LP infeasible instead of failing the request.
     const solved = optimizeWithRecovery(req.hours, req.battery, directives);
-    const response = validateAndFormatPlan(req, solved.directives, solved.plan);
+    const response = OptimizeEnergyResponseSchema.parse(
+      validateAndFormatPlan(req, solved.directives, solved.plan),
+    );
     return NextResponse.json(response, { status: 200 });
   } catch (err) {
+    if (err instanceof InfeasibleError) {
+      return NextResponse.json(
+        { error: "No feasible schedule exists for the given hours and battery limits." },
+        { status: 422 },
+      );
+    }
     // Full detail stays in server logs only; the client gets a generic message.
     console.error("[optimize-energy] pipeline failed:", err);
     return NextResponse.json(
