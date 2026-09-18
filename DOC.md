@@ -67,6 +67,66 @@ All 17 checks currently pass (`npm run test:types`), `npx tsc --noEmit` is clean
 
 ---
 
+## 3. Phase 2 — LLM Interpretation Engine
+
+**Status:** done. Corresponds to `PLAN.md` → Phase 2 → "Prompt Engineering (`src/services/llm.ts`)".
+
+**Location note:** placed at **[src/services/llm.ts](src/services/llm.ts)**, matching the plan's own path (unlike Phase 1's types, which were relocated to match the existing repo layout — see §2 above). This is the first file to actually introduce a `src/` directory into the project.
+
+**Model choice — deviation from PLAN.md:** the plan describes a generic "Fast Generative Model" and doesn't name a provider. This was implemented against the **Google Gemini API** (`gemini-3.6-flash`, via the official `@google/genai` SDK) at explicit user request, not Anthropic's API. `@google/genai` was added as a new dependency.
+
+### What the module does
+
+`src/services/llm.ts` exports one function:
+
+```ts
+interpretOperatorNotes(operatorNotes: string[], battery: BatteryInput): Promise<DirectiveInterpretation[]>
+```
+
+Given the request's `operator_notes` array and `battery` object, it returns one `DirectiveInterpretation` (from `types/gridwise.ts`) per note — the exact shape Phase 3's guardrail layer expects to receive and re-validate. It never throws: every failure path degrades to a safe default (see Fallback strategy below), because a crashed Phase 2 call would take down the whole `/optimize-energy` request.
+
+### Why structured output instead of prompting for JSON text
+
+The naive approach — asking the model to "reply with JSON" and `JSON.parse()`-ing free text — is fragile: models wrap output in markdown fences, add prose before/after, or produce near-JSON that fails to parse. Instead, this uses Gemini's **structured output** feature: a `responseSchema` (built from the SDK's `Type` enum: `OBJECT`, `ARRAY`, `STRING`, `INTEGER`, `BOOLEAN`, `NUMBER`) passed alongside `responseMimeType: "application/json"`. This constrains generation at the API level so the response is guaranteed to be syntactically valid JSON matching the schema's structure — no markdown-fence stripping, no "hope the model behaved" step.
+
+The schema mirrors `DirectiveInterpretationSchema` from `types/gridwei.ts` (array of `{ note_index, applies, directive_type, structured_adjustment, explanation }`), with `directive_type` constrained to the same 6-value enum used everywhere else in the codebase, so the LLM literally cannot emit a directive type the rest of the pipeline doesn't recognize.
+
+**One deliberate simplification, and why:** the plan (and the follow-up prompt) asked for `structured_adjustment`'s shape to vary per `directive_type` — e.g. only `factor` for `solar_reduction`, only `minimum_energy_kwh` for `minimum_battery_reserve`. Gemini's structured-output schema format (a constrained subset of OpenAPI) does not reliably support "shape of field X depends on the value of field Y" (conditional/discriminated-union schemas). Rather than fight the API into an unreliable shape under a hard latency budget, `structured_adjustment` is defined as **one flat object with all four possible fields optional** (`hours`, `factor`, `minimum_energy_kwh`, `max_grid_kwh`), and the "only populate the fields relevant to this directive type" rule is pushed into the **system prompt** instead of the schema. This is safe specifically because **Phase 3 (not yet built) is specified to re-validate `structured_adjustment` per-directive-type anyway** — so an LLM that ignores the field-discipline instruction and leaves a stray field populated is caught downstream, not silently trusted.
+
+### System prompt — encoding PLAN.md's 5 interpretation rules
+
+`buildSystemPrompt()` generates a prompt (parameterized by the request's actual `battery.capacity_kwh`, so the model does the percentage→kWh math against the real number, not a placeholder) that encodes every rule from `PLAN.md` Phase 2, each with a worked example so the model has a concrete pattern to match rather than an abstract rule to interpret:
+
+| Rule | Encoded as | Example baked into the prompt |
+|---|---|---|
+| Sequential processing, 1 output per input note | "ORDERING" section | — |
+| 5 directives + `no_op` fallback for distractors | "CATEGORIZATION" section, one line per directive type | `no_op` explicitly requires `applies: false`, `structured_adjustment: null` |
+| Start-inclusive/end-exclusive time windows | "TIME RANGES" section | `"1 PM to 3 PM" → hours: [13, 14]` (not 15); `"noon until 2 PM" → [12, 13]` (not 14); `"6 PM until 10 PM" → [18, 19, 20, 21]` (not 22) — the exact three examples from `PLAN.md` |
+| Solar reduction → remaining fraction | "SOLAR NORMALIZATION" | `"reduce solar by 80%" → factor: 0.2` |
+| Relative battery reserve → absolute kWh | "RELATIVE BATTERY RESERVES" | `"keep at least 50% of capacity"` with the request's actual `capacity_kwh` interpolated into both the instruction text and the worked example, so the model sees the real arithmetic it needs to reproduce |
+| Field discipline (the schema simplification above) | "FIELD DISCIPLINE" | explicit: only populate fields relevant to the chosen `directive_type`; `no_op` must be null |
+
+The user-turn message (`buildUserPrompt()`) is just the notes array rendered as `index: text` lines — all the interpretation logic lives in the system prompt, keeping the per-request payload minimal (matters for latency and token cost on every call).
+
+### Latency and fallback strategy — why this shape specifically
+
+PLAN.md requires p95 latency under 5 seconds for the *whole* `/optimize-energy` request, and the follow-up prompt specified a strict 4500ms budget for this one sub-step with **zero retries**. The reasoning: a retry after a timeout would already blow the remaining budget before Phase 3/4/5 even start, so retrying is strictly worse than failing fast.
+
+- **Model choice for speed:** `gemini-3.6-flash` (not a larger/slower Gemini tier) — this task is short text → small structured JSON, well within a fast model's capability, and speed is the binding constraint here, not raw intelligence.
+- **Hard timeout, belt-and-suspenders:** an `AbortController` fires `.abort()` at exactly 4500ms via `setTimeout`, and its `signal` is passed to the SDK call *twice* — as `config.abortSignal` and via `config.httpOptions.timeout`. Two independent mechanisms were used because the exact abort-plumbing behavior of a fast-moving SDK isn't something to bet a hard deadline on; if one path doesn't actually cut the request, the other does.
+- **Fallback, not failure:** the entire call is wrapped in `try/catch`. On *any* failure — timeout abort, network error, an empty `result.text`, or `JSON.parse` throwing on malformed output — `fallbackDirectives()` returns one `{ applies: false, directive_type: "no_op", structured_adjustment: null, explanation: "LLM interpretation unavailable; defaulted to no_op." }` per input note. This is a safe default because `no_op` directives are inert — Phase 4's solver runs the optimization with no directive constraints applied, i.e., it degrades to "ignore the operator notes, optimize on hard battery/grid physics alone" rather than crashing the request or returning a half-formed plan.
+- **`finally { clearTimeout(timer) }`** ensures the abort timer doesn't fire after a request that already completed (or already failed and returned).
+
+### Dependency change
+
+`@google/genai` was added to `package.json` dependencies — the official Google Gen AI SDK, used for the `GoogleGenAI` client and the `Type` enum that builds the structured-output schema. The client reads `GEMINI_API_KEY` from the environment; this key is **not yet set** anywhere in the repo (no `.env` / `.env.example` exists yet) — needed before this code can actually run against the live API.
+
+### Verification
+
+`npx tsc --noEmit -p tsconfig.json` is clean for `src/services/llm.ts` specifically (the project's one remaining type error, in `app/layout.tsx`, is a pre-existing Next.js 16 generated-types issue unrelated to this work). No runtime test was added yet — there's no sample-case harness to run it against until Phase 6, and no live `GEMINI_API_KEY` in this environment to smoke-test an actual call.
+
+---
+
 ## Not yet done
 
-Per `PLAN.md`, still outstanding: Phase 2 (LLM interpretation service), Phase 3 (guardrail normalizer — including the per-directive `structured_adjustment` shape checks noted above), Phase 4 (LP solver, needs `javascript-lp-solver`, not yet installed), Phase 5 (replay engine + route handlers), Phase 6 (sample-case regression tests), Phase 7 (Docker/deploy), Phase 8 (README/video).
+Per `PLAN.md`, still outstanding: Phase 3 (guardrail normalizer — including the per-directive `structured_adjustment` shape checks this phase deliberately deferred to it, see §3 above), Phase 4 (LP solver, needs `javascript-lp-solver`, not yet installed), Phase 5 (replay engine + route handlers — including wiring `interpretOperatorNotes` into the actual `/optimize-energy` handler), Phase 6 (sample-case regression tests), Phase 7 (Docker/deploy), Phase 8 (README/video). Also outstanding: setting `GEMINI_API_KEY` so Phase 2 can be smoke-tested against the live API.
