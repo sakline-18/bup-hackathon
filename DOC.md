@@ -127,6 +127,50 @@ PLAN.md requires p95 latency under 5 seconds for the *whole* `/optimize-energy` 
 
 ---
 
+## 4. Phase 3 — Deterministic Guardrails & Normalizer
+
+**Status:** done. Corresponds to `PLAN.md` → Phase 3 → "Implement Validation Layer (`src/services/guardrail.ts`)".
+
+**File created:** [src/services/guardrail.ts](src/services/guardrail.ts). It exports two functions and defines no new schemas — it only imports `DirectiveInterpretation` from `types/gridwise.ts`.
+
+```ts
+normalizeDirectives(rawInterpretations: DirectiveInterpretation[], noteCount: number, batteryCapacityKwh: number): DirectiveInterpretation[]
+normalizeHours(hours: unknown): number[]
+```
+
+### How it resolves the loose `structured_adjustment`
+
+Phase 1 typed `structured_adjustment` as `Record<string, unknown> | null`, and Phase 2 had the LLM emit one flat object with every possible field (`hours`, `factor`, `minimum_energy_kwh`, `max_grid_kwh`) optional, because Gemini's structured output can't express per-directive schemas. That means anything the LLM returned could reach the solver with stray or wrong-typed fields.
+
+`normalizeDirectives` closes that gap. A `switch` on `directive_type` builds a **fresh** `structured_adjustment` object containing only the fields that directive owns. Extra fields the LLM populated are discarded, never copied. The solver (Phase 4) can therefore rely on the exact shape per directive:
+
+| `directive_type` | Guaranteed output shape | Rejected (→ `no_op`) when |
+|---|---|---|
+| `solar_reduction` | `{ factor, hours? }` | `factor` missing, non-finite, or outside `[0, 1]`. `hours` is normalized and kept only if non-empty. |
+| `minimum_battery_reserve` | `{ minimum_energy_kwh }` | missing, non-finite, `< 0`, or `> batteryCapacityKwh` |
+| `max_grid_window` | `{ max_grid_kwh, hours }` | `max_grid_kwh` missing, non-finite, or `< 0`; or `hours` empty after normalization |
+| `no_charge_window` / `no_discharge_window` | `{ hours }` | `hours` missing or empty after normalization |
+| `no_op` | `null`, `applies: false` | never rejected — forced |
+
+### Normalization rules implemented
+
+- **Cardinality and ordering:** output always has exactly `noteCount` entries, ordered `note_index` 0 to `noteCount - 1`. Indices are re-assigned from the position, so out-of-order input is sorted. Missing entries are filled with a `no_op`. Out-of-range or non-integer `note_index` values are ignored. On duplicate indices the first entry wins.
+- **Hour cleaning (`normalizeHours`):** non-arrays become `[]`. Keeps only integers in `0–23`, dedupes with `[...new Set(hours)]`, then sorts ascending with `.sort((a, b) => a - b)`.
+- **Inconsistent flags:** a non-`no_op` directive with `applies !== true` is downgraded to `no_op`, so the solver never sees a populated adjustment the LLM said doesn't apply.
+- **Safe failure:** the function never throws (per-note `try/catch` plus type checks that accept malformed runtime input). Every rejection becomes `directive_type: "no_op"`, `applies: false`, `structured_adjustment: null`, with an `explanation` like `Guardrail rejected solar_reduction: factor must be a number in [0, 1]. Defaulted to no_op.`
+- **Purity:** the input array and its objects are never mutated; a new array of new objects is returned.
+
+### Judgment calls worth knowing
+
+- `solar_reduction` keeps its `hours` (the Phase 2 prompt has the LLM emit them and Phase 4's `effective_solar[h]` needs them), but the plan only requires validating `factor`, so an empty/missing `hours` is **not** a rejection. Phase 4 must decide what a solar reduction without hours means (e.g. all day).
+- `max_grid_window` with empty hours is rejected, since a cap with no window is meaningless. The plan only said to normalize its hours.
+
+### Verification
+
+`npx tsc --noEmit` reports no errors in `guardrail.ts`. A throwaway script (not committed, per the "skip tests" default) exercised: `factor: 1.5` rejection, hallucinated extra fields dropped, hours `[15, 13, 13, 99, -1, 1.5]` → `[13, 15]`, out-of-order/duplicate/missing indices, `no_op` with a populated adjustment, negative `max_grid_kwh`, empty hours, and `undefined` input. All produced the expected output. `guardrail.ts` is not yet wired into a route handler — that happens in Phase 5.
+
+---
+
 ## Not yet done
 
-Per `PLAN.md`, still outstanding: Phase 3 (guardrail normalizer — including the per-directive `structured_adjustment` shape checks this phase deliberately deferred to it, see §3 above), Phase 4 (LP solver, needs `javascript-lp-solver`, not yet installed), Phase 5 (replay engine + route handlers — including wiring `interpretOperatorNotes` into the actual `/optimize-energy` handler), Phase 6 (sample-case regression tests), Phase 7 (Docker/deploy), Phase 8 (README/video). Also outstanding: setting `GEMINI_API_KEY` so Phase 2 can be smoke-tested against the live API.
+Per `PLAN.md`, still outstanding: Phase 4 (LP solver, needs `javascript-lp-solver`, not yet installed), Phase 5 (replay engine + route handlers — including wiring `interpretOperatorNotes` into the actual `/optimize-energy` handler), Phase 6 (sample-case regression tests), Phase 7 (Docker/deploy), Phase 8 (README/video). Also outstanding: setting `GEMINI_API_KEY` so Phase 2 can be smoke-tested against the live API.
