@@ -171,6 +171,80 @@ Phase 1 typed `structured_adjustment` as `Record<string, unknown> | null`, and P
 
 ---
 
+## 5. Phase 4 — Linear Programming Math Optimizer
+
+**Status:** done. Corresponds to `PLAN.md` → Phase 4 → "Formulate Optimization Model (`src/services/optimizer.ts`)".
+
+**File created:** [src/services/optimizer.ts](src/services/optimizer.ts). It exports one function:
+
+```ts
+optimizeSchedule(hours: HourInput[], battery: BatteryInput, directives: DirectiveInterpretation[]): HourlyPlanEntry[]
+```
+
+It takes the 24 validated hourly rows, the battery's physical limits, and the guardrail-normalized directives (Phase 3's output), and returns the 24-entry dispatch plan Phase 5's replay engine will re-check and format into the final response.
+
+### Dependency
+
+`javascript-lp-solver` (`^1.0.3`) was installed — it ships its own TypeScript types (`dist/index.d.ts`), so no separate `@types/javascript-lp-solver` package exists or is needed (`PLAN.md`'s reference install command lists one, but the registry has no such package).
+
+### LP model construction
+
+Five decision variables are created per hour `h` (`g{h}`, `s{h}`, `c{h}`, `d{h}`, `E{h}` for grid import, solar used, battery charge, battery discharge, and end-of-hour state-of-charge), built as a plain JSON model object matching the solver's native format (`{ optimize, opType, constraints, variables }`) rather than its fluent `Model` class API — this keeps the per-hour constraint wiring a flat loop instead of 24 rounds of imperative `addTerm` calls.
+
+The objective (`optimize: "cost"`, `opType: "min"`) sums `g_h * tariff_bdt_per_kwh[h]` over all hours, plus a `0.0001` cost on every `c_h` and `d_h`. That penalty exists specifically to kill zero-cost charge/discharge cycling: when tariffs are flat across a stretch of hours, a pure grid-cost objective is indifferent between `idle` and `charge 5 / discharge 5` in the same hour (both cost the same, satisfy the same balance equation), so the solver could return either — nondeterministically, from run to run of the underlying simplex. The 0.0001 term makes `idle` strictly cheaper than any nonzero charge/discharge pair, so the solver only moves battery energy when it's cost-motivated, not as directionless noise the discretization step would then have to clean up.
+
+Constraints per hour, keyed by hour index so hour-local terms never collide:
+
+| Constraint | Shape | Directive interaction |
+|---|---|---|
+| `balance{h}` (equal) | `g_h + s_h + d_h - c_h = demand_kwh[h]` | — |
+| `solarCap{h}` (max) | `s_h <= effective_solar[h]` | `effective_solar[h] = solar_kwh[h] * (product of all applicable solar_reduction factors)` — see below |
+| `chargeLim{h}` / `dischargeLim{h}` (max) | `c_h <= max_charge_kwh_per_hour`, `d_h <= max_discharge_kwh_per_hour` | forced to `0` for any hour inside a `no_charge_window` / `no_discharge_window` directive |
+| `gridLim{h}` (max) | `g_h <= max_grid_kwh` | constraint is only added at all when a `max_grid_window` directive covers that hour — otherwise `g_h` is unbounded above (its only real cap comes indirectly through cost minimization) |
+| `batCap{h}` (max) | `E_h <= capacity_kwh` | — |
+| `batMin{h}` (min) | `E_h >= max(battery.minimum_energy_kwh, directive_reserve[h])` | see reserve handling below |
+| `trans{h}` (equal) | `h=0`: `E_0 - c_0 + d_0 = initial_energy_kwh`; `h>0`: `E_h - E_{h-1} - c_h + d_h = 0` | — |
+| `eod` (equal, once) | `E_23 = initial_energy_kwh` | — |
+
+### Turning directives into per-hour arrays (`buildDirectiveState`)
+
+Before the model loop runs, `buildDirectiveState` walks the (already guardrail-normalized) `directives` array once and produces five parallel 24-length arrays — `solarFactor`, `minReserve`, `noCharge`, `noDischarge`, `maxGrid` — so the per-hour constraint-building loop never has to re-scan directives. Non-applying and `no_op` entries are skipped up front.
+
+Two judgment calls, both driven by what Phase 3's guardrail actually emits (see §4 above), not by `PLAN.md`'s literal text:
+
+- **`solar_reduction` without an `hours` field applies to all 24 hours.** The guardrail only requires `hours` to be non-empty *if present* — it's optional. A reduction note like "solar output is down today" with no specific window has no hours to anchor to, so treating an absent window as "the whole day" is the only reading that doesn't silently drop the directive.
+- **`minimum_battery_reserve` always applies to every hour, not a window.** The guardrail's accepted shape for this directive is `{ minimum_energy_kwh }` — no `hours` field exists in its output at all (see §4's table). So there's no per-hour information to apply selectively; the reserve is treated as a floor on `E_h` for all `h`. Multiple such directives combine via `Math.max` (the strictest reserve wins), and `solar_reduction` factors from multiple overlapping directives combine multiplicatively (each is "remaining usable fraction," so two 50%-reduction notes on the same hour compound to 25%, not overridden 50%).
+
+### Post-processing: why the solver's raw output isn't the answer
+
+An LP relaxation's solution is a real-valued vector — a solved `c_h` might be `4.999999999997` or the solver might, for a genuinely indifferent hour, land on some arbitrary micro-nonzero split between `c_h` and `d_h` that nets to the same balance but doesn't read as a clean action. Passing that straight into `HourlyPlanEntry` would produce a technically-valid-but-ugly plan and, worse, floating-point drift that compounds hour over hour until `E_23` no longer exactly equals `initial_energy_kwh` — which Phase 6's regression suite checks for an **exact** match, not a tolerance. The discretization pass exists specifically to convert "LP-optimal but numerically messy" into "clean and exactly closed."
+
+The result-processing loop runs a second time over `h = 0..23`, sequentially, carrying `prevEnergy` (starting at `battery.initial_energy_kwh`) forward by hand rather than trusting the solver's own `E_h` values, per this exact sequence:
+
+1. **Net delta.** `Δ = c_h - d_h`, taken from the solver's raw `c_h`/`d_h` — **except** for `h = 23`, where `Δ` is instead forced to `battery.initial_energy_kwh - prevEnergy` (`prevEnergy` here is the *already-recalculated* `E_22`, not the solver's raw one). This is the strict-closure rule from the spec: hour 23 doesn't get to have its own opinion about `c_23`/`d_23` at all — whatever the running recalculated total is, hour 23's action is defined as exactly what closes the loop back to `initial_energy_kwh`, so `E_23 = initial_energy_kwh` holds as an *identity* of the post-processing arithmetic, not as something that depends on the solver's floating-point precision.
+2. **Action routing.** `Δ > 1e-4` → `charge` with `battery_kwh = round(Δ, 4)`; `Δ < -1e-4` → `discharge` with `battery_kwh = round(-Δ, 4)`; otherwise → `idle`, `battery_kwh = 0`. This is where the 0.0001 objective penalty pays off: because the solver was already biased away from spurious simultaneous charge/discharge, the `1e-4` dead-zone here is cleaning up genuine floating-point noise, not adjudicating a real ambiguous case the objective left unresolved.
+3. **Sequential state recalculation.** `battery_energy_after_kwh = round(prevEnergy + batteryCharge - batteryDischarge, 4)`, then `prevEnergy` is reassigned to that rounded value before moving to `h + 1`. Every hour's `E_h` is therefore built from the previous *rounded* hour, not the solver's raw (and now-superseded) values — this is what makes the chain exact instead of merely close.
+4. **Grid slack rebalancing.** `solar_used_kwh` is taken from the solver's raw `s_h` (clamped to `[0, effective_solar[h]]` and rounded — the solver has no reason to produce a value outside that range, the clamp is defensive) but `grid_kwh` is **not** taken from the solver's raw `g_h` at all. It's recomputed from the already-rounded battery numbers: `grid_kwh = max(0, round(demand_kwh + battery_charge - solar_used - battery_discharge, 4))`. This is required because steps 1–3 can shift the battery's contribution by up to the rounding epsilon relative to what the solver assumed when it picked `g_h` — if `grid_kwh` were left as the solver's original value, the hour's energy balance (`grid + solar + discharge = demand + charge`) would no longer hold exactly against the *rounded* battery numbers. Recomputing `g_h` as the residual makes it the slack variable that absorbs 100% of the discretization's rounding, keeping every single hour's balance equation exact by construction.
+
+### Robustness / failure handling
+
+- **Malformed hour input:** `hours` must be exactly 24 entries, sorted by `.hour`, covering `0..23` with no gaps or duplicates — checked explicitly before any model construction, throwing `optimizeSchedule: expected exactly 24 hourly inputs...` or `...missing or duplicate hour near index {h}` otherwise. The plan's spec assumes valid input reaches this function (Phase 1's Zod schema already enforces `hours.length === 24`), but hour *ordering* and *coverage* (0–23 each exactly once) aren't things the schema checks, so this function checks them itself rather than trusting the caller.
+- **Solver throwing:** wrapped in `try/catch`; rethrown as `optimizeSchedule: LP solver threw an error: {message}`.
+- **Infeasible model:** `javascript-lp-solver` doesn't throw for infeasibility — it returns `{ feasible: false, ... }`. That's checked explicitly and converted into `optimizeSchedule: LP model is infeasible for the given hours, battery limits, and directives.` (An infeasible model is possible in practice — e.g. a `minimum_battery_reserve` directive demanding more than `battery.capacity_kwh` slips past the guardrail's `<= capacity_kwh` check only because the guardrail checks against the *raw* request's `battery.capacity_kwh` at parse time, which is the same value the solver uses, so this path mainly guards against directive combinations that are individually valid but jointly unsatisfiable, e.g. a `no_charge_window` covering enough hours that the battery physically cannot reach a later `minimum_battery_reserve` floor in time.)
+
+In every failure path, `optimizeSchedule` throws a plain `Error` with a message prefixed `optimizeSchedule:` rather than returning a partial or malformed plan — Phase 5 (not yet built) is expected to catch this and turn it into the route handler's safe HTTP 500, per `PLAN.md`'s Phase 5 spec ("Catch unexpected errors and return safe HTTP 500 without leaking stack traces or secrets").
+
+### Verification
+
+`npx tsc --noEmit -p tsconfig.json` reports no errors for `optimizer.ts`. Two throwaway smoke scripts (run via `npx tsx`, not committed, per the "skip tests" default) were used to exercise the module end-to-end since there's no sample-case harness until Phase 6:
+
+- A 24-hour scenario with a cheap overnight tariff, an expensive evening peak (hours 18–21), solar available hours 6–17, and a `no_discharge_window` directive over hours 6–8. Result: the solver charged the battery overnight when the grid was cheap, discharged it to cover the evening peak, respected the no-discharge window, and the plan's own totals independently confirm energy balance (`total_grid + total_solar + total_discharge - total_charge == total_demand`, within `0.05` on hand-summed floats) and exact end-of-day closure (`plan[23].battery_energy_after_kwh === battery.initial_energy_kwh`).
+- A deliberately-infeasible scenario (a `minimum_battery_reserve` directive demanding `100` kWh against a `5` kWh battery capacity) confirmed `optimizeSchedule` throws the expected infeasibility error rather than returning a bogus plan.
+
+`optimizer.ts` is not yet wired into a route handler — that's Phase 5's job, same as Phase 3's `guardrail.ts`.
+
+---
+
 ## Not yet done
 
-Per `PLAN.md`, still outstanding: Phase 4 (LP solver, needs `javascript-lp-solver`, not yet installed), Phase 5 (replay engine + route handlers — including wiring `interpretOperatorNotes` into the actual `/optimize-energy` handler), Phase 6 (sample-case regression tests), Phase 7 (Docker/deploy), Phase 8 (README/video). Also outstanding: setting `GEMINI_API_KEY` so Phase 2 can be smoke-tested against the live API.
+Per `PLAN.md`, still outstanding: Phase 5 (replay engine + route handlers — including wiring `interpretOperatorNotes`, `normalizeDirectives`, and `optimizeSchedule` into the actual `/optimize-energy` handler), Phase 6 (sample-case regression tests), Phase 7 (Docker/deploy), Phase 8 (README/video). Also outstanding: setting `GEMINI_API_KEY` so Phase 2 can be smoke-tested against the live API.
