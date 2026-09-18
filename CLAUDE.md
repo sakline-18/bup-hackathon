@@ -6,7 +6,7 @@ We are in a 4-hour hackathon. Speed and working features are the ONLY priorities
 - **No Over-engineering:** Build the simplest, dirtiest thing that works. We refactor nothing today.
 - **Hardcode First:** Use mock data aggressively. Only connect to the real database when the UI is fully functional.
 - **Skip Tests:** Do not write unit tests or test files unless explicitly asked.
-- **Conventions:** Use TypeScript. Use Tailwind for all styling. Use npm (the repo has `package-lock.json`). There is no Shadcn/`components/ui/` directory.
+- **Conventions:** Use TypeScript. Use Tailwind for all styling. Use npm (the repo has `package-lock.json`). Components live in `components/` (no Shadcn `components/ui/`).
 
 ## Verification (CRITICAL)
 - Never claim a UI change works without verifying it. 

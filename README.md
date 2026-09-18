@@ -336,7 +336,12 @@ BASE_URL=https://YOUR-APP.vercel.app npm run test:samples
 
 Any Node host works: `npm run build && npm start` serves on port 3000.
 
-**Docker.** A Dockerfile and published image are **not included yet**. Until one is added, use the source quickstart above.
+**Docker.** A multi-stage `Dockerfile` (Next.js standalone output) is included; no published image yet.
+
+```bash
+docker build -t gridwise .
+docker run -p 3000:3000 -e GROQ_API_KEY=your_groq_api_key_here gridwise
+```
 
 ---
 
@@ -393,7 +398,7 @@ PLAN.md                       Original implementation plan
 - **Dropping is not repairing.** When a directive is infeasible, the whole directive is ignored; the system does not try to fix its value. A wrong-but-feasible value (such as a slightly wrong hour window) is still applied.
 - **One directive per note.** A note that contains two separate rules is mapped to one directive.
 - **Cold starts.** On serverless hosting the first request after idle is slower.
-- **No Docker image yet.**
+- **No published Docker image yet** (build it from the included `Dockerfile`).
 
 ---
 
