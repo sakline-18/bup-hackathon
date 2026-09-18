@@ -369,8 +369,8 @@ To see where the prompt goes wrong, each of the two gpt-oss models was run throu
 - **Prompt injection is only mitigated in the prompt.** Nothing in the code can tell a real directive from an injected one, so a determined attacker may still succeed. A note that legitimately says "no solar all day" is indistinguishable in shape from an injected one.
 - **Rate limits.** Free-tier Groq allows 8,000 tokens per minute per model, and a request costs roughly 1.5–2k tokens, so about 4 requests per minute per model. The chain absorbs bursts for a while by moving to the next model, but a sustained load falls through to weaker models or to `no_op`.
 - **`no_op` from an all-models failure is silent to the caller.** The response is a valid 200 with an unconstrained plan, and only the explanation text says the LLM was unavailable.
-- **Tied optima in the LP** still make `peak_grid_kwh` and the exact hourly plan differ from the reference in SAMPLE-01 and SAMPLE-09 (see the known gap below).
-- **Models 3-5 of the chain have never answered a request.** Their JSON-mode outputs are only protected by the guardrail. They were not part of the accuracy tests.
+- **Tied optima in the LP** make the hourly plan (and sometimes `peak_grid_kwh`) differ from the reference. This is accepted by the judging rules; see the note below.
+- **Models 3-5 of the chain have never answered a request.** Their JSON-mode outputs are only protected by the guardrail. An accuracy run for them was started but stopped before it finished, so they remain untested.
 
 ### Model recommendation
 
@@ -393,7 +393,7 @@ The guardrail (§4) still validates whatever the model returns, so a schema slip
 - **The fallback was exercised for real.** In an earlier unpaced run the 120b returned HTTP 429 (token-per-minute limit) four times; those requests were answered by the next model in the chain rather than defaulting to `no_op`. That run was before the log line for the answering model existed, so which model answered isn't recorded.
 - **Not exercised:** the case where all five models fail. It is the same code path as the no-key fallback above, but it was not triggered with real failing models. Models 3–5 were never observed answering.
 
-**Known gap: `peak_grid_kwh` can differ from the reference.** In SAMPLE-01 (187.5 vs 175) and SAMPLE-09 (187 vs 170) the total cost and total grid energy match exactly, but the LP has tied optimal plans and picks a different one. The tests above check cost, not peak. If the grader checks peak or the exact hourly plan, the optimizer would need a tie-break.
+**`peak_grid_kwh` can differ from the reference, and that is acceptable.** In SAMPLE-01 (187.5 vs 175) and SAMPLE-09 (187 vs 170) the total cost and total grid energy match exactly, but the LP has tied optimal plans and picks a different one. In fact our hourly plan differs from the reference plan in all 10 cases; the peak just happens to match in 8. The problem statement says "no byte-for-byte matching: equivalent valid optimal schedules may differ", and the rubric scores interpretation, directive application, validity and recalculated cost. The only peak requirement is that `peak_grid_kwh` equals the value recalculated from `hourly_plan`, which `replay.ts` guarantees (checked on all 10 cases). No tie-break was added.
 
 ---
 
