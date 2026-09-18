@@ -87,7 +87,7 @@ function buildSystemPrompt(capacityKwh: number): string {
    - "1 PM to 3 PM" -> hours: [13, 14]   (NOT 15)
    - "noon until 2 PM" -> hours: [12, 13]   (NOT 14)
    - "6 PM until 10 PM" -> hours: [18, 19, 20, 21]   (NOT 22)
-   Put the hours array under structured_adjustment.hours. This field applies to no_charge_window, no_discharge_window, and max_grid_window (as the window during which the cap applies).
+   Put the hours array under structured_adjustment.hours. This field is REQUIRED for solar_reduction, minimum_battery_reserve, no_charge_window, no_discharge_window, and max_grid_window (as the window during which the directive applies).
 
 4. SOLAR NORMALIZATION: For solar_reduction, convert a stated reduction percentage into the REMAINING usable fraction (1 - reduction), placed at structured_adjustment.factor.
    - "reduce solar by 80%" -> factor: 0.2
@@ -97,6 +97,7 @@ function buildSystemPrompt(capacityKwh: number): string {
 5. RELATIVE BATTERY RESERVES: For minimum_battery_reserve, convert a stated percentage of capacity into an absolute kWh value using the battery's capacity_kwh, which is ${capacityKwh} kWh for this request. Place the result at structured_adjustment.minimum_energy_kwh.
    - "keep at least 50% of capacity" with capacity_kwh=${capacityKwh} -> minimum_energy_kwh: ${capacityKwh * 0.5}
    If the note states an absolute kWh value directly, use it as-is.
+   Also include structured_adjustment.hours for the hours during which the reserve must be held, using the start-inclusive/end-exclusive rule above.
 
 6. MAX GRID WINDOW: For max_grid_window, place the numeric cap (in kWh) at structured_adjustment.max_grid_kwh and the applicable hours at structured_adjustment.hours.
 

@@ -52,7 +52,6 @@ function buildDirectiveState(
   const noCharge = Array<boolean>(HOURS).fill(false);
   const noDischarge = Array<boolean>(HOURS).fill(false);
   const maxGrid = Array<number>(HOURS).fill(Infinity);
-  const allHours = Array.from({ length: HOURS }, (_, i) => i);
 
   for (const directive of directives ?? []) {
     if (!directive || !directive.applies || directive.directive_type === "no_op") {
@@ -65,15 +64,14 @@ function buildDirectiveState(
       case "solar_reduction": {
         const factor = adj.factor;
         if (typeof factor !== "number" || !Number.isFinite(factor)) break;
-        const hours = collectHourSet(adj.hours);
-        const targets = hours.length > 0 ? hours : allHours;
-        for (const h of targets) solarFactor[h] *= factor;
+        // Guardrail guarantees `hours`; only those hours are affected.
+        for (const h of collectHourSet(adj.hours)) solarFactor[h] *= factor;
         break;
       }
       case "minimum_battery_reserve": {
         const reserve = adj.minimum_energy_kwh;
         if (typeof reserve !== "number" || !Number.isFinite(reserve)) break;
-        for (let h = 0; h < HOURS; h++) {
+        for (const h of collectHourSet(adj.hours)) {
           minReserve[h] = Math.max(minReserve[h], reserve);
         }
         break;

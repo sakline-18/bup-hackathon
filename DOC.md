@@ -146,8 +146,8 @@ Phase 1 typed `structured_adjustment` as `Record<string, unknown> | null`, and P
 
 | `directive_type` | Guaranteed output shape | Rejected (→ `no_op`) when |
 |---|---|---|
-| `solar_reduction` | `{ factor, hours? }` | `factor` missing, non-finite, or outside `[0, 1]`. `hours` is normalized and kept only if non-empty. |
-| `minimum_battery_reserve` | `{ minimum_energy_kwh }` | missing, non-finite, `< 0`, or `> batteryCapacityKwh` |
+| `solar_reduction` | `{ factor, hours }` | `factor` missing, non-finite, or outside `[0, 1]`; or `hours` missing/empty after normalization |
+| `minimum_battery_reserve` | `{ minimum_energy_kwh, hours }` | `minimum_energy_kwh` missing, non-finite, `< 0`, or `> batteryCapacityKwh`; or `hours` missing/empty after normalization |
 | `max_grid_window` | `{ max_grid_kwh, hours }` | `max_grid_kwh` missing, non-finite, or `< 0`; or `hours` empty after normalization |
 | `no_charge_window` / `no_discharge_window` | `{ hours }` | `hours` missing or empty after normalization |
 | `no_op` | `null`, `applies: false` | never rejected — forced |
@@ -162,12 +162,13 @@ Phase 1 typed `structured_adjustment` as `Record<string, unknown> | null`, and P
 
 ### Judgment calls worth knowing
 
-- `solar_reduction` keeps its `hours` (the Phase 2 prompt has the LLM emit them and Phase 4's `effective_solar[h]` needs them), but the plan only requires validating `factor`, so an empty/missing `hours` is **not** a rejection. Phase 4 must decide what a solar reduction without hours means (e.g. all day).
-- `max_grid_window` with empty hours is rejected, since a cap with no window is meaningless. The plan only said to normalize its hours.
+- **Strict `hours` enforcement.** The canonical specification requires an `hours` array for both `minimum_battery_reserve` and `solar_reduction`. `guardrail.ts` now rejects either directive (downgrading it to `no_op`) if `hours` is missing or empty after normalization. Because the LLM emits a flat object schema, this is the layer that catches hallucinated or incomplete output, so non-compliant directives never reach the solver.
+- `max_grid_window` with empty hours is likewise rejected, since a cap with no window is meaningless.
+- The Phase 2 prompt in `llm.ts` was updated to tell the LLM to emit `hours` for `minimum_battery_reserve` as well, so valid notes aren't rejected.
 
 ### Verification
 
-`npx tsc --noEmit` reports no errors in `guardrail.ts`. A throwaway script (not committed, per the "skip tests" default) exercised: `factor: 1.5` rejection, hallucinated extra fields dropped, hours `[15, 13, 13, 99, -1, 1.5]` → `[13, 15]`, out-of-order/duplicate/missing indices, `no_op` with a populated adjustment, negative `max_grid_kwh`, empty hours, and `undefined` input. All produced the expected output. `guardrail.ts` is not yet wired into a route handler — that happens in Phase 5.
+`npx tsc --noEmit` reports no errors in `guardrail.ts`. A throwaway script (not committed, per the "skip tests" default) exercised: `factor: 1.5` rejection, hallucinated extra fields dropped, hours `[15, 13, 13, 99, -1, 1.5]` → `[13, 15]`, out-of-order/duplicate/missing indices, `no_op` with a populated adjustment, negative `max_grid_kwh`, empty hours, and `undefined` input. All produced the expected output. `guardrail.ts` was wired into the route handler in Phase 5.
 
 ---
 
@@ -210,10 +211,10 @@ Constraints per hour, keyed by hour index so hour-local terms never collide:
 
 Before the model loop runs, `buildDirectiveState` walks the (already guardrail-normalized) `directives` array once and produces five parallel 24-length arrays — `solarFactor`, `minReserve`, `noCharge`, `noDischarge`, `maxGrid` — so the per-hour constraint-building loop never has to re-scan directives. Non-applying and `no_op` entries are skipped up front.
 
-Two judgment calls, both driven by what Phase 3's guardrail actually emits (see §4 above), not by `PLAN.md`'s literal text:
+Both `solar_reduction` and `minimum_battery_reserve` are now strictly scoped to the `hours` array in their directive. Phase 3's guardrail guarantees that array is present and non-empty for both (see §4), so the optimizer has no "missing hours" fallback and never applies either directive globally:
 
-- **`solar_reduction` without an `hours` field applies to all 24 hours.** The guardrail only requires `hours` to be non-empty *if present* — it's optional. A reduction note like "solar output is down today" with no specific window has no hours to anchor to, so treating an absent window as "the whole day" is the only reading that doesn't silently drop the directive.
-- **`minimum_battery_reserve` always applies to every hour, not a window.** The guardrail's accepted shape for this directive is `{ minimum_energy_kwh }` — no `hours` field exists in its output at all (see §4's table). So there's no per-hour information to apply selectively; the reserve is treated as a floor on `E_h` for all `h`. Multiple such directives combine via `Math.max` (the strictest reserve wins), and `solar_reduction` factors from multiple overlapping directives combine multiplicatively (each is "remaining usable fraction," so two 50%-reduction notes on the same hour compound to 25%, not overridden 50%).
+- **`solar_reduction` applies only to its listed hours.** `effective_solar[h]` is multiplied by `factor` only for `h` in `hours`. Factors from multiple overlapping directives combine multiplicatively (each is a "remaining usable fraction," so two 50%-reduction notes on the same hour compound to 25%, not overridden 50%).
+- **`minimum_battery_reserve` is enforced only during its listed hours.** `minReserve[h]` is raised to `minimum_energy_kwh` only for `h` in `hours`, so the `batMin{h}` floor on `E_h` applies just inside that window; other hours keep the battery's own `minimum_energy_kwh`. Multiple such directives combine via `Math.max` (the strictest reserve wins) per hour.
 
 ### Post-processing: why the solver's raw output isn't the answer
 
@@ -232,7 +233,7 @@ The result-processing loop runs a second time over `h = 0..23`, sequentially, ca
 - **Solver throwing:** wrapped in `try/catch`; rethrown as `optimizeSchedule: LP solver threw an error: {message}`.
 - **Infeasible model:** `javascript-lp-solver` doesn't throw for infeasibility — it returns `{ feasible: false, ... }`. That's checked explicitly and converted into `optimizeSchedule: LP model is infeasible for the given hours, battery limits, and directives.` (An infeasible model is possible in practice — e.g. a `minimum_battery_reserve` directive demanding more than `battery.capacity_kwh` slips past the guardrail's `<= capacity_kwh` check only because the guardrail checks against the *raw* request's `battery.capacity_kwh` at parse time, which is the same value the solver uses, so this path mainly guards against directive combinations that are individually valid but jointly unsatisfiable, e.g. a `no_charge_window` covering enough hours that the battery physically cannot reach a later `minimum_battery_reserve` floor in time.)
 
-In every failure path, `optimizeSchedule` throws a plain `Error` with a message prefixed `optimizeSchedule:` rather than returning a partial or malformed plan — Phase 5 (not yet built) is expected to catch this and turn it into the route handler's safe HTTP 500, per `PLAN.md`'s Phase 5 spec ("Catch unexpected errors and return safe HTTP 500 without leaking stack traces or secrets").
+In every failure path, `optimizeSchedule` throws a plain `Error` with a message prefixed `optimizeSchedule:` rather than returning a partial or malformed plan — Phase 5's route handler catches this and turn it into the route handler's safe HTTP 500, per `PLAN.md`'s Phase 5 spec ("Catch unexpected errors and return safe HTTP 500 without leaking stack traces or secrets").
 
 ### Verification
 
@@ -241,10 +242,59 @@ In every failure path, `optimizeSchedule` throws a plain `Error` with a message 
 - A 24-hour scenario with a cheap overnight tariff, an expensive evening peak (hours 18–21), solar available hours 6–17, and a `no_discharge_window` directive over hours 6–8. Result: the solver charged the battery overnight when the grid was cheap, discharged it to cover the evening peak, respected the no-discharge window, and the plan's own totals independently confirm energy balance (`total_grid + total_solar + total_discharge - total_charge == total_demand`, within `0.05` on hand-summed floats) and exact end-of-day closure (`plan[23].battery_energy_after_kwh === battery.initial_energy_kwh`).
 - A deliberately-infeasible scenario (a `minimum_battery_reserve` directive demanding `100` kWh against a `5` kWh battery capacity) confirmed `optimizeSchedule` throws the expected infeasibility error rather than returning a bogus plan.
 
-`optimizer.ts` is not yet wired into a route handler — that's Phase 5's job, same as Phase 3's `guardrail.ts`.
+`optimizer.ts` is not yet wired into a route handler — wired in during Phase 5, along with Phase 3's `guardrail.ts`.
+
+---
+
+## 6. Phase 5 — Replay Engine, Metrics, and Route Handlers
+
+**Status:** done. Corresponds to `PLAN.md` → Phase 5.
+
+**Files created:** [src/services/replay.ts](src/services/replay.ts), [app/health/route.ts](app/health/route.ts), [app/optimize-energy/route.ts](app/optimize-energy/route.ts).
+
+> **Location note:** `PLAN.md` says `src/app/...`, but this project's App Router lives at the repo root (`app/`). Next.js ignores `src/app` whenever a root `app/` exists, so the routes are in `app/health/` and `app/optimize-energy/` — otherwise they would 404.
+
+### `src/services/replay.ts` — independent replay validator
+
+```ts
+validateAndFormatPlan(request: OptimizeEnergyRequest, directives: DirectiveInterpretation[], plan: HourlyPlanEntry[]): OptimizeEnergyResponse
+```
+
+It trusts nothing from the solver. It re-derives the per-hour limits (solar factor, reserve floor, no-charge / no-discharge / grid-cap windows) directly from the directives with its own code, not by reusing the optimizer's `buildDirectiveState`. Then it walks the 24 hours once, carrying the battery energy forward itself.
+
+**How the 0.01 tolerance is enforced:** a single constant `TOL = 0.01`. Every check is an absolute comparison against it and **throws** an `Error` (message prefixed `Replay: hour N ...`) on the first violation:
+
+| Check | Throws when |
+|---|---|
+| Energy balance | `abs(grid + solar + discharge - (demand + charge)) > 0.01` |
+| Solar limit | `solar_used > solar_kwh × (product of solar_reduction factors for that hour) + 0.01` |
+| Battery state chain | `abs(replayed E_h - battery_energy_after_kwh) > 0.01`, where the replayed value is the previous hour's energy plus charge minus discharge |
+| Capacity | `battery_energy_after > capacity_kwh + 0.01` |
+| Minimum reserve | `battery_energy_after < max(battery.minimum_energy_kwh, directive reserve for that hour) - 0.01`. The directive reserve applies only inside its `hours` window. |
+| End-of-day neutrality | `abs(E_23 - initial_energy_kwh) > 0.01` |
+
+Beyond the five required checks it also rejects negative values, charge/discharge above the rate limits, charging or discharging inside a `no_charge_window` / `no_discharge_window`, and grid above a `max_grid_window` cap, each with the same `0.01` tolerance. A deviation of 0.005 passes; 0.5 throws.
+
+**Metrics** are recomputed from the plan, not taken from the solver: `total_grid_kwh = Σ grid_kwh`, `total_cost_bdt = Σ grid_kwh × tariff`, `peak_grid_kwh = max grid_kwh` (each rounded to 4 decimals). `plan_summary` is a one-paragraph string with the totals, the peak hour, solar used, battery charged/discharged, and how many operator notes applied as constraints.
+
+### `app/health/route.ts`
+
+`GET` returns HTTP 200 with exactly `{ "status": "ok" }`.
+
+### `app/optimize-energy/route.ts`
+
+`POST` is the whole pipeline: Zod validation → `interpretOperatorNotes` → `normalizeDirectives` → `optimizeSchedule` → `validateAndFormatPlan` → HTTP 200 with the response.
+
+- **400 (bad request):** the body is read with `request.json()` inside its own `try/catch`, and the result goes through `OptimizeEnergyRequestSchema.safeParse()`. Unparseable JSON and structurally invalid bodies both produce HTTP 400 `{ "error": "Malformed JSON or structurally invalid request." }`. The pipeline never runs.
+- **500 (internal failure):** the four pipeline steps sit in a second `try/catch`. Any throw (LP infeasibility, solver error, replay violation, unexpected bug) is logged server-side with `console.error` and answered with HTTP 500 `{ "error": "Internal server error while optimizing energy." }`. The response contains no message, stack trace, or environment detail from the underlying error.
+- An LLM timeout or failure does not reach this handler: `interpretOperatorNotes` already degrades to all-`no_op` (Phase 2), so the request still succeeds with an unconstrained plan.
+
+### Verification
+
+`npx tsc --noEmit` is clean. Against the dev server: `GET /health` → 200 `{"status":"ok"}`; a body missing fields → 400; a non-JSON body → 400; a valid 24-hour payload → 200 with a full plan (no `GEMINI_API_KEY` is set, so the notes fell back to `no_op`). `replay.ts` was also exercised with a throwaway script (not committed) using real reserve and solar-reduction directives through the optimizer: the untampered plan passed, and tampering with the energy balance, solar usage, reserve, and end-of-day energy each threw. A 0.005 deviation passed. The 500 path was not triggered end to end, and nothing has been run against a live Gemini response.
 
 ---
 
 ## Not yet done
 
-Per `PLAN.md`, still outstanding: Phase 5 (replay engine + route handlers — including wiring `interpretOperatorNotes`, `normalizeDirectives`, and `optimizeSchedule` into the actual `/optimize-energy` handler), Phase 6 (sample-case regression tests), Phase 7 (Docker/deploy), Phase 8 (README/video). Also outstanding: setting `GEMINI_API_KEY` so Phase 2 can be smoke-tested against the live API.
+Per `PLAN.md`, still outstanding: Phase 6 (sample-case regression tests), Phase 7 (Docker/deploy), Phase 8 (README/video). Also outstanding: setting `GEMINI_API_KEY` so the full pipeline can be smoke-tested against the live API.

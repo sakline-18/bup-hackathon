@@ -41,10 +41,11 @@ function buildAdjustment(
       if (!isFiniteNumber(factor) || factor < 0 || factor > 1) {
         return reject("factor must be a number in [0, 1]");
       }
-      // Hours are optional here: the plan only requires `factor`, but the
-      // prompt has the LLM emit the affected window alongside it.
+      // The canonical spec requires `hours`; a missing/empty window is an LLM
+      // hallucination we must not pass to the solver.
       const hours = normalizeHours(raw.hours);
-      return accept(hours.length > 0 ? { factor, hours } : { factor });
+      if (hours.length === 0) return reject("no valid hours in 0-23");
+      return accept({ factor, hours });
     }
 
     case "minimum_battery_reserve": {
@@ -58,7 +59,10 @@ function buildAdjustment(
           `minimum_energy_kwh must be a finite number in [0, ${batteryCapacityKwh}]`,
         );
       }
-      return accept({ minimum_energy_kwh });
+      // The canonical spec requires `hours` for the reserve window too.
+      const hours = normalizeHours(raw.hours);
+      if (hours.length === 0) return reject("no valid hours in 0-23");
+      return accept({ minimum_energy_kwh, hours });
     }
 
     case "max_grid_window": {
