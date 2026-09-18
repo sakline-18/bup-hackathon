@@ -328,11 +328,15 @@ Running the 10 sample cases in `tests.json` through `/optimize-energy` with Gemi
 |---|---|---|---|
 | 1 | `openai/gpt-oss-20b` | json_schema, `reasoning_effort: "low"` | Primary, chosen for speed: about twice as fast as the 120b (median ~0.7 s vs ~1 s in our tests). |
 | 2 | `openai/gpt-oss-120b` | json_schema, `reasoning_effort: "low"` | Second: more accurate on unit and wording traps, so it is the first fallback. |
-| 3 | `llama-3.3-70b-versatile` | plain `json_object` | Production model without schema enforcement; the guardrail still checks the result. |
-| 4 | `qwen/qwen3.8-27b` | json_schema, `reasoning_effort: "none"` | Preview-tier (may be discontinued), so it sits below the production models. |
-| 5 | `llama-3.1-8b-instant` | plain `json_object` | Last resort: fastest, least accurate. |
+| 3 | `openai/gpt-oss-safeguard-20b` | json_schema, `reasoning_effort: "low"` | Same family and API features as the first two. Tested 43/43 and the fastest model measured. |
+| 4 | `qwen/qwen3.8-27b` | json_schema, `reasoning_effort: "none"` | Preview-tier (may be discontinued). **Tested and found inaccurate on hour windows, see below.** |
+| 5 | `groq/compound-mini` | plain `json_object` | Untested tail fallback (an agentic system, so may be slower). |
+| 6 | `groq/compound` | plain `json_object` | Untested tail fallback. |
+| 7 | `allam-2-7b` | plain `json_object` | Untested tail fallback: small model, last resort. |
 
-A model is skipped, and the next one tried, on **any** failure: HTTP error (notably 429 rate limit and 5xx), timeout, empty reply, invalid JSON, or a reply that doesn't contain exactly one directive per note. If all five fail, or the time runs out, every note becomes `no_op` exactly as before. The order can be overridden with `GROQ_MODELS="model-a,model-b,..."`.
+The chain was rewritten to match the models this API key can actually use (the Groq console's rate-limit page lists `allam-2-7b`, `groq/compound`, `groq/compound-mini`, the two prompt-guard models, `openai/gpt-oss-120b`, `openai/gpt-oss-20b`, `openai/gpt-oss-safeguard-20b` and `qwen/qwen3.8-27b`, each at 30 requests per minute). `llama-3.3-70b-versatile` and `llama-3.1-8b-instant` were removed because they are not available on this key. The prompt-guard models are safety classifiers and are not used. Models 1-4 were fixed by the project owner; the order of 5-7 is my choice (larger and more capable first).
+
+A model is skipped, and the next one tried, on **any** failure: HTTP error (notably 429 rate limit and 5xx), timeout, empty reply, invalid JSON, or a reply that doesn't contain exactly one directive per note. If every model fails, or the time runs out, every note becomes `no_op` exactly as before. The order can be overridden with `GROQ_MODELS="model-a,model-b,..."`.
 
 **Time budget.** The whole interpretation step shares one 4500 ms budget (`TOTAL_BUDGET_MS`). A single attempt is capped at 2500 ms (`ATTEMPT_CAP_MS`) so a hung model can't consume the time the fallbacks need. Fast failures such as a 429 cascade to the next model immediately, and no attempt starts with under 300 ms left. Successful calls log `[llm] <model> answered in <N>ms` and failures log `[llm] <model> failed, trying next: <reason>`.
 
@@ -369,8 +373,22 @@ To see where the prompt goes wrong, each of the two gpt-oss models was run throu
 - **Prompt injection is only mitigated in the prompt.** Nothing in the code can tell a real directive from an injected one, so a determined attacker may still succeed. A note that legitimately says "no solar all day" is indistinguishable in shape from an injected one.
 - **Rate limits.** Free-tier Groq allows 8,000 tokens per minute per model, and a request costs roughly 1.5–2k tokens, so about 4 requests per minute per model. The chain absorbs bursts for a while by moving to the next model, but a sustained load falls through to weaker models or to `no_op`.
 - **`no_op` from an all-models failure is silent to the caller.** The response is a valid 200 with an unconstrained plan, and only the explanation text says the LLM was unavailable.
-- **Tied optima in the LP** still make `peak_grid_kwh` and the exact hourly plan differ from the reference in SAMPLE-01 and SAMPLE-09 (see the known gap below).
-- **Models 3-5 of the chain have never answered a request.** Their JSON-mode outputs are only protected by the guardrail. They were not part of the accuracy tests.
+- **Tied optima in the LP** make the hourly plan (and sometimes `peak_grid_kwh`) differ from the reference. This is accepted by the judging rules; see the note below.
+- **`qwen/qwen3.8-27b` (position 4) is inaccurate on hour windows.** It scored 33/43 and every miss is the same off-by-one: it drops the last hour of any window of three or more hours (e.g. 6 PM to 9 PM gave `[18, 19]` instead of `[18, 19, 20]`). Because the result is valid-looking, the guardrail cannot catch it, and the plan then under-applies the directive. It only answers if the three gpt-oss models all fail. Options: move it to the end of the chain, remove it, or try `reasoning_effort` other than `none`. Not yet changed, since the order was fixed by the project owner.
+- **Chain positions 5-7 (`groq/compound-mini`, `groq/compound`, `allam-2-7b`) have never answered a request** and were not tested. Their output is protected only by the guardrail.
+
+### Accuracy of the first four models (final chain)
+
+Each of the first four models was run separately through the 10 sample cases plus the 23 adversarial notes (43 directives), calling the real `interpretOperatorNotes` and guardrail:
+
+| Model | Correct | Latency median / p95 / max |
+|---|---|---|
+| `openai/gpt-oss-20b` | 43/43 | 0.69 s / 1.1 s / 1.6 s |
+| `openai/gpt-oss-120b` | 43/43 | 0.97 s / 1.8 s / 2.4 s |
+| `openai/gpt-oss-safeguard-20b` | 43/43 | 0.40 s / 0.60 s / 0.63 s |
+| `qwen/qwen3.8-27b` | **33/43** | 0.46 s / 1.2 s / 1.6 s |
+
+`gpt-oss-safeguard-20b` matched the other gpt-oss models on accuracy and was the fastest, so it would be a candidate to move up the chain. It was left at position 3 as specified. The qwen failures are described under "Areas that need attention".
 
 ### Model recommendation
 
@@ -380,7 +398,6 @@ From Groq's model list at the time of writing (speed figures are Groq's own, not
 |---|---|---|---|
 | **`openai/gpt-oss-120b`** | ~500 tok/s | json_schema | **Second in the chain.** Production tier. More reliable at the hour-window and percentage arithmetic this task depends on, and still far inside the 4.5 s budget for a ~300-token reply. |
 | `openai/gpt-oss-20b` | ~1000 tok/s | json_schema | **First in the chain** (fastest). Tested 43/43 after the prompt fixes below, but it was the weaker model on wording and unit traps before them. |
-| `llama-3.3-70b-versatile` | ~280 tok/s | JSON mode only | Not recommended: slower, no schema enforcement, listed as Enterprise. |
 | `qwen/qwen3.8-27b` | ~450 tok/s | json_schema | Preview only, so it may be discontinued at short notice. |
 
 The guardrail (§4) still validates whatever the model returns, so a schema slip degrades to `no_op` for that note rather than reaching the solver. Best-effort (`strict: false`) mode was used because it is the mode Groq documents for the gpt-oss models.
@@ -391,9 +408,9 @@ The guardrail (§4) still validates whatever the model returns, so a schema slip
 - With no key set, `POST /optimize-energy` returns 200 in about 12 ms with the notes defaulted to `no_op`, and the log shows `GROQ_API_KEY is not set`.
 - **All 10 cases in `tests.json` pass end to end** through the real endpoint (paced 16 s apart to stay under the 120b's token-per-minute cap). Each was checked for: `applies`, `directive_type` and `structured_adjustment` matching the expected directives (hours order and key order ignored), `total_cost_bdt` within 0.01, and `E_23 == initial_energy_kwh`. Every case was answered by `openai/gpt-oss-120b` in 0.8–1.9 s, which is well inside the 4.5 s budget.
 - **The fallback was exercised for real.** In an earlier unpaced run the 120b returned HTTP 429 (token-per-minute limit) four times; those requests were answered by the next model in the chain rather than defaulting to `no_op`. That run was before the log line for the answering model existed, so which model answered isn't recorded.
-- **Not exercised:** the case where all five models fail. It is the same code path as the no-key fallback above, but it was not triggered with real failing models. Models 3–5 were never observed answering.
+- **Not exercised:** the case where every model fails. It is the same code path as the no-key fallback above, but it was not triggered with real failing models.
 
-**Known gap: `peak_grid_kwh` can differ from the reference.** In SAMPLE-01 (187.5 vs 175) and SAMPLE-09 (187 vs 170) the total cost and total grid energy match exactly, but the LP has tied optimal plans and picks a different one. The tests above check cost, not peak. If the grader checks peak or the exact hourly plan, the optimizer would need a tie-break.
+**`peak_grid_kwh` can differ from the reference, and that is acceptable.** In SAMPLE-01 (187.5 vs 175) and SAMPLE-09 (187 vs 170) the total cost and total grid energy match exactly, but the LP has tied optimal plans and picks a different one. In fact our hourly plan differs from the reference plan in all 10 cases; the peak just happens to match in 8. The problem statement says "no byte-for-byte matching: equivalent valid optimal schedules may differ", and the rubric scores interpretation, directive application, validity and recalculated cost. The only peak requirement is that `peak_grid_kwh` equals the value recalculated from `hourly_plan`, which `replay.ts` guarantees (checked on all 10 cases). No tie-break was added.
 
 ---
 
@@ -484,7 +501,14 @@ Both remain straightforward once a target registry/host is chosen: the image alr
 
 ---
 
-## 10. Live optimizer form on the landing page
+## 10. README and sample test runner
+
+- **[README.md](README.md)** was rewritten from the create-next-app boilerplate into a full guide: what the service does, quickstart, API reference, how each pipeline stage works, configuration, deployment, test results, project structure and known limitations. It follows what the participant guide asks a README to contain (setup, environment-variable names, model/provider, the LLM's role, guardrails, solver, run command, curl examples, public-sample test command, limitations, no secret values). It was written before §9's Dockerfile and §11's form existed, so it should be spot-checked against those additions.
+- **[scripts/test-samples.mjs](scripts/test-samples.mjs)** (`npm run test:samples`) is a new end-to-end runner — the Phase 6 harness `PLAN.md` calls for. It posts every case in `tests.json` to `BASE_URL` (default `http://localhost:3000`) and checks each note's `applies` / `directive_type` / adjustment (hour and key order ignored), `total_cost_bdt` within 0.01, and that the battery ends at its initial energy. It exits non-zero on any failure, so it also works against the deployed URL. Verified: 10/10 passed against a local server with the live Groq API.
+
+---
+
+## 11. Live optimizer form on the landing page
 
 **Status:** done, on request ("make a form containing all the fields from tests.json, connected to the frontend").
 
@@ -497,9 +521,8 @@ No new dependencies — plain Tailwind, no shadcn install (`CLAUDE.md` asks for 
 ### Verification
 
 `npx tsc --noEmit` shows no new errors (the one pre-existing `app/layout.tsx` error is unrelated, per §6). Ran `npm run dev` and confirmed via `curl` that the page's server-rendered HTML contains the form. Then POSTed SAMPLE-01's `input` object (byte-identical to what the form sends when that sample is loaded and submitted unmodified) straight at `/optimize-energy` and got back `200` with `total_cost_bdt: 34600` and a 24-entry `hourly_plan` — confirming the form's payload shape matches the live route handler end to end. Browser-based click-through wasn't done this pass (the Claude-in-Chrome extension wasn't connected in this environment); the curl check above verifies the wiring but not the on-screen interaction.
-
 ---
 
 ## Not yet done
 
-Per `PLAN.md`, still outstanding: Phase 6 (formal sample-case regression test runner — `tests.json` exists and all 10 cases were exercised ad hoc against the live endpoint in §7/§8, but no `scripts/test-samples.ts` harness was written), the deployment portions of Phase 7 (see §9), Phase 8 (README/video).
+Per `PLAN.md`, still outstanding: the deployment portions of Phase 7 (registry push + live cloud deploy, see §9), and Phase 8's 3-minute video. Phase 6 (§10) and the README (§10) are now done; `README.md` should be given a pass to mention the Dockerfile (§9) and the live form (§11), since it was written before either existed.

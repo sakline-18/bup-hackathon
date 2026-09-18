@@ -11,9 +11,14 @@ const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
 const DEFAULT_MODELS = [
   "openai/gpt-oss-20b", // fastest, ~1000 tok/s
   "openai/gpt-oss-120b", // more accurate on hour/percentage maths, ~500 tok/s
-  "llama-3.3-70b-versatile", // JSON mode only, ~280 tok/s
+  "openai/gpt-oss-safeguard-20b", // gpt-oss family, same API features
   "qwen/qwen3.8-27b", // preview model, schema-capable
-  "llama-3.1-8b-instant", // last resort: fastest, least accurate
+  // Tail fallbacks (JSON mode only, never accuracy-tested; the guardrail
+  // still validates their output). Prompt-guard models are classifiers and
+  // are deliberately not used.
+  "groq/compound-mini",
+  "groq/compound",
+  "allam-2-7b",
 ];
 // The whole interpretation step shares one budget (PLAN.md: p95 < 5 s for the
 // full request). A single attempt is capped lower so a hung model can't eat
