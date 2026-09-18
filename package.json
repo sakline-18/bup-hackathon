@@ -7,7 +7,8 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "test:types": "node scripts/test-gridwise-types.ts"
+    "test:types": "node scripts/test-gridwise-types.ts",
+    "test:samples": "node scripts/test-samples.mjs"
   },
   "dependencies": {
     "javascript-lp-solver": "^1.0.3",
